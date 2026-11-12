@@ -8,7 +8,7 @@
 #include <stdarg.h>
 
 #include <switch.h>
-#include <deko3d.h>
+#include <drako3d.h>
 
 #ifndef DK_UNIFORM_BUF_ALIGNMENT
 #define DK_UNIFORM_BUF_ALIGNMENT 0x100
