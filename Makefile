@@ -192,27 +192,27 @@ $(ROMFS_FOLDERS):
 
 $(ROMFS_SHADERS)/%_vsh.dksh: %_vsh.glsl
 	@echo {vert} $(notdir $<)
-	@uam -s vert -o $@ $<
+	@uam2 -s vert -o $@ $<
 
 $(ROMFS_SHADERS)/%_tcsh.dksh: %_tcsh.glsl
 	@echo {tess_ctrl} $(notdir $<)
-	@uam -s tess_ctrl -o $@ $<
+	@uam2 -s tess_ctrl -o $@ $<
 
 $(ROMFS_SHADERS)/%_tesh.dksh: %_tesh.glsl
 	@echo {tess_eval} $(notdir $<)
-	@uam -s tess_eval -o $@ $<
+	@uam2 -s tess_eval -o $@ $<
 
 $(ROMFS_SHADERS)/%_gsh.dksh: %_gsh.glsl
 	@echo {geom} $(notdir $<)
-	@uam -s geom -o $@ $<
+	@uam2 -s geom -o $@ $<
 
 $(ROMFS_SHADERS)/%_fsh.dksh: %_fsh.glsl
 	@echo {frag} $(notdir $<)
-	@uam -s frag -o $@ $<
+	@uam2 -s frag -o $@ $<
 
 $(ROMFS_SHADERS)/%.dksh: %.glsl
 	@echo {comp} $(notdir $<)
-	@uam -s comp -o $@ $<
+	@uam2 -s comp -o $@ $<
 
 endif
 
