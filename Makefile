@@ -10,8 +10,14 @@ TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libounce/switch2_rules
 
 DRAKO3D		?=	$(abspath $(TOPDIR)/../drako3d)
-UAM2		?=	$(DEVKITPRO)/tools/bin/uam2
+ifeq ($(OS),Windows_NT)
+EXEEXT		?=	.exe
+endif
+UAM2		?=	$(DEVKITPRO)/tools/bin/uam2$(EXEEXT)
 DK_LIB		?=	drako3d
+ifeq ($(wildcard $(DRAKO3D)/lib/lib$(DK_LIB).a),)
+DRAKO3D		:=	$(LIBNX)
+endif
 
 #---------------------------------------------------------------------------------
 # TARGET is the name of the output
@@ -46,7 +52,7 @@ BUILD		:=	build
 SOURCES		:=	source source/DK3D source/shaders
 DATA		:=	data
 INCLUDES	:=	include
-APP_TITLE   :=  CUDA-95NX
+APP_TITLE   :=  CUDA-95OZ
 APP_AUTHOR  :=  ClunkerBlunker
 APP_VERSION :=  0.1
 
