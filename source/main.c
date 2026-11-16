@@ -8,7 +8,10 @@
 #include <stdarg.h>
 
 #include <switch.h>
-#include <deko3d.h>
+#include <drako3d.h>
+
+#include "dk_console.h"
+#include "stress_csh_dksh.h"
 
 #ifndef DK_UNIFORM_BUF_ALIGNMENT
 #define DK_UNIFORM_BUF_ALIGNMENT 0x100
@@ -18,23 +21,26 @@
 
 #define WG_SIZE_X 16
 #define WG_SIZE_Y 16
-// groups are dispatched in a 4x4 grid, for 2048 threads total
-// 2048 per SM = 4096 on TX1, so we fully saturate the GPU
-#define NUM_GROUPS_X 4
-#define NUM_GROUPS_Y 4
+// groups are dispatched in a 9x8 grid, 72 groups of 256 threads
+// T239 has 12 SMs with 48 warps (1536 threads) each
+#define NUM_GROUPS_X 9
+#define NUM_GROUPS_Y 8
 
-#define N_THREADS ((NUM_GROUPS_X * WG_SIZE_X) * (NUM_GROUPS_Y * WG_SIZE_Y))  // 4096
+#define N_THREADS ((NUM_GROUPS_X * WG_SIZE_X) * (NUM_GROUPS_Y * WG_SIZE_Y))  // 18432
 #define N_ROWS 64
 
-// Thread buffers = N_ROWS * N_THREADS, must be power of 2
-#define N_VEC ((uint64_t)N_ROWS * N_THREADS)   // uvec4 elements, 2^18
-#define N_ELEMS (N_VEC * 4)                      // uints, 2^20
+// Thread buffers = N_ROWS * N_THREADS
+#define N_VEC ((uint64_t)N_ROWS * N_THREADS)   // uvec4 elements, 1179648 (18 MiB)
+#define N_ELEMS (N_VEC * 4)                      // uints
 
-_Static_assert((N_VEC & (N_VEC - 1)) == 0,
-               "N_ROWS * N_THREADS must be a power of two for the scatter mask");
+// N_VEC isn't a power of two anymore
+#define DRAM_WINDOW_VEC (1u << 20)
 
-// Gather size, 8192 * 16B = 128KB per SM. Fits into L2 perfectly
-#define L2_WINDOW_VEC 8192u                      
+_Static_assert((DRAM_WINDOW_VEC & (DRAM_WINDOW_VEC - 1)) == 0 && DRAM_WINDOW_VEC <= N_VEC,
+               "DRAM_WINDOW_VEC must be a power of two for the scatter mask and fit in the data buffer");
+
+// Gather size, 32768 * 16B = 512KB. Half of T239's 1MB L2.
+#define L2_WINDOW_VEC 32768u
 #define DISPATCHES_PER_LIST 32
 #define NUM_INFLIGHT 3
 #define MAX_RECORDS 64          // fault records per batch, per slot
@@ -78,7 +84,7 @@ typedef struct {
     uint32_t max_records;
     uint32_t mode;          // 0 = capture golden, 1 = compare, 2 = ignore
     uint32_t scatter_mask;  // Gather window - 1, used for errors.
-    uint32_t chain_bias;    
+    uint32_t chain_bias;
 } Params;
 
 // Result buffer
@@ -109,20 +115,20 @@ typedef struct {
 // Testing modes
 // Balanced tried to hit both
 // Core forces 2x chains and not as much memory access, although in practice it strains it enough.
-// Dram scatters reads accross allocated size (4MB, lol, lmao even)
-// L2 changes this to 256KB.
+// Dram scatters reads accross allocated size (16MB, lol, lmao even)
+// L2 changes this to 512KB.
 static const Profile kProfiles[] = {
     { "balanced", 64, 32, 0 },
-    { "core", 512, 4, 0 },  
-    { "dram", 8, 256, 0 },  
-    { "l2", 8, 256, L2_WINDOW_VEC },  
+    { "core", 512, 4, 0 },
+    { "dram", 8, 256, 0 },
+    { "l2", 8, 256, L2_WINDOW_VEC },
 };
 #define NUM_PROFILES ((int)(sizeof(kProfiles) / sizeof(kProfiles[0])))
 
 static uint32_t scatterMaskFor(int profile)
 {
     uint32_t win = kProfiles[profile].window;
-    if (win == 0u) win = (uint32_t)N_VEC;
+    if (win == 0u) win = DRAM_WINDOW_VEC;
     return win - 1u;
 }
 
@@ -278,44 +284,34 @@ static void debugCallback(void* userData, const char* context,
     (void)userData;
     if (result == DkResult_Success) {
         g_tally.warnings++;
-        note("deko3d warn [%s]: %s", context, message);
+        note("drako3d warn [%s]: %s", context, message);
         return;
     }
-    note("deko3d ERROR [%s]: %s", context, message);
+    note("drako3d ERROR [%s]: %s", context, message);
     if (g_hud) { drawLog(); drawTally(); }
     consoleUpdate(NULL);
     svcSleepThread(10ULL * 1000000000ULL);
     exit(EXIT_FAILURE);
 }
 
-static bool loadShader(DkShader* shader, BumpAlloc* codeMem, const char* path)
+static bool loadShader(DkShader* shader, BumpAlloc* codeMem, const char* name,
+                       const void* blob, size_t blobSize)
 {
-    FILE* f = fopen(path, "rb");
-    if (!f) { note("cannot open %s", path); return false; }
-
     DkshHeaderLocal hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != DKSH_MAGIC) {
-        note("%s is not a DKSH file", path);
-        fclose(f);
+    if (blobSize < sizeof(hdr)) { note("%s is truncated", name); return false; }
+    memcpy(&hdr, blob, sizeof(hdr));
+    if (hdr.magic != DKSH_MAGIC || (size_t)hdr.control_sz + hdr.code_sz > blobSize) {
+        note("%s is not a DKSH file", name);
         return false;
     }
 
     void* control = malloc(hdr.control_sz);
-    if (!control) { fclose(f); return false; }
-
-    rewind(f);
-    if (fread(control, hdr.control_sz, 1, f) != 1) {
-        free(control); fclose(f); return false;
-    }
+    if (!control) return false;
+    memcpy(control, blob, hdr.control_sz);
 
     uint32_t codeOff = bumpAlloc(codeMem, hdr.code_sz, DK_SHADER_CODE_ALIGNMENT);
-    if (codeOff == UINT32_MAX) { free(control); fclose(f); return false; }
-
-    fseek(f, hdr.control_sz, SEEK_SET);
-    if (fread(cpuPtr(codeMem, codeOff), hdr.code_sz, 1, f) != 1) {
-        free(control); fclose(f); return false;
-    }
-    fclose(f);
+    if (codeOff == UINT32_MAX) { free(control); return false; }
+    memcpy(cpuPtr(codeMem, codeOff), (const uint8_t*)blob + hdr.control_sz, hdr.code_sz);
 
     DkShaderMaker maker;
     dkShaderMakerDefaults(&maker, codeMem->block, codeOff);
@@ -326,7 +322,7 @@ static bool loadShader(DkShader* shader, BumpAlloc* codeMem, const char* path)
     return dkShaderIsValid(shader);
 }
 
-// Usual Deko3D memory allocation
+// Usual drako3d memory allocation
 typedef struct {
     DkQueue queue;
     DkCmdBuf cmdbuf;
@@ -347,7 +343,7 @@ typedef struct {
     uint32_t* dataCpu;
 
     // Golden digests
-    DkGpuAddr expAddr;    
+    DkGpuAddr expAddr;
     uint32_t expSize;
 } Ctx;
 
@@ -390,7 +386,7 @@ static RunStatus runSync(Ctx* c, uint32_t slot, GpuResult* out, uint64_t* outNs)
     uint64_t t0 = armGetSystemTick();
     dkQueueSubmitCommands(c->queue, c->batch[slot]);
     // CPU politely asks for the data
-    dkQueueSignalFence(c->queue, &fence, true);  
+    dkQueueSignalFence(c->queue, &fence, true);
     dkQueueFlush(c->queue);
 
     DkResult r = dkFenceWait(&fence, (int64_t)FENCE_TIMEOUT_NS);
@@ -411,7 +407,7 @@ static RunStatus runSync(Ctx* c, uint32_t slot, GpuResult* out, uint64_t* outNs)
 static void reportRecords(Ctx* c, uint32_t slot, uint32_t errCount)
 {
     uint32_t shown = errCount < MAX_RECORDS ? errCount : MAX_RECORDS;
-    if (shown > 3) shown = 3;   
+    if (shown > 3) shown = 3;
 
     for (uint32_t i = 0; i < shown; i++) {
         GpuRecord r = c->recCpu[slot][i];
@@ -426,7 +422,7 @@ static void reportRecords(Ctx* c, uint32_t slot, uint32_t errCount)
 // Seperated because this way we can distinguish between source corruption and the GPU on a bender.
 static uint32_t checkDataIntegrity(Ctx* c)
 {
-    const uint32_t stride = 997;  
+    const uint32_t stride = 997;
     uint32_t bad = 0;
     for (uint64_t i = 0; i < N_ELEMS; i += stride)
         if (c->dataCpu[i] != dataBits(i)) bad++;
@@ -443,7 +439,7 @@ static bool calibrate(Ctx* c, Params base, uint32_t* goldDigest, uint32_t* goldM
     Params p = base;
 
     // Capture data
-    p.mode = 0;                     
+    p.mode = 0;
     recordBatches(c, p, 1);
     if (runSync(c, 0, &r, NULL) != RUN_OK) {
         note("calibration: capture run failed");
@@ -451,7 +447,7 @@ static bool calibrate(Ctx* c, Params base, uint32_t* goldDigest, uint32_t* goldM
     }
 
     // Compare against what we have
-    p.mode = 1;                       
+    p.mode = 1;
     recordBatches(c, p, 1);
 
     uint32_t d[3], m[3];
@@ -487,7 +483,7 @@ static bool calibrate(Ctx* c, Params base, uint32_t* goldDigest, uint32_t* goldM
 }
 
 // Wait what do you mean the CPU exists
-static void runDemo(PadState* pad)
+static void runDemo(DkDevice device, PadState* pad)
 {
     Ctx c;
     memset(&c, 0, sizeof(c));
@@ -497,11 +493,6 @@ static void runDemo(PadState* pad)
            N_ROWS, N_THREADS, (unsigned long long)N_VEC,
            (unsigned long long)(N_VEC * 16 / 1024));
     consoleUpdate(NULL);
-
-    DkDeviceMaker devMaker;
-    dkDeviceMakerDefaults(&devMaker);
-    devMaker.cbDebug = debugCallback;
-    DkDevice device = dkDeviceCreate(&devMaker);
 
     // Setup queues
     DkQueueMaker queueMaker;
@@ -522,8 +513,8 @@ static void runDemo(PadState* pad)
                   | DkMemBlockFlags_Code;
     BumpAlloc codeMem = { dkMemBlockCreate(&mbMaker), 0, CODEMEM_SIZE };
 
-    uint32_t dataSize = (uint32_t)(N_ELEMS * sizeof(uint32_t));   // 4 MiB
-    uint32_t expSize = N_THREADS * sizeof(uint32_t);             // 16 KiB
+    uint32_t dataSize = (uint32_t)(N_ELEMS * sizeof(uint32_t));   // 18 MiB
+    uint32_t expSize = N_THREADS * sizeof(uint32_t);             // 72 KiB
     uint32_t recSize = MAX_RECORDS * sizeof(GpuRecord);          // 1 KiB
     uint32_t dataMemSize = ALIGN_UP(CMDMEM_SIZE + dataSize + expSize
                                     + NUM_INFLIGHT * (recSize + 0x100) + 0x4000,
@@ -570,7 +561,7 @@ static void runDemo(PadState* pad)
     for (uint64_t i = 0; i < N_ELEMS; i++)
         c.dataCpu[i] = dataBits(i);
 
-    if (!loadShader(&c.shader, &codeMem, "romfs:/shaders/stress_csh.dksh")) {
+    if (!loadShader(&c.shader, &codeMem, "stress_csh.dksh", stress_csh_dksh, stress_csh_dksh_size)) {
         note("could not load stress_csh.dksh, aborting");
         return;
     }
@@ -847,7 +838,6 @@ static void runDemo(PadState* pad)
     dkMemBlockDestroy(dataMem.block);
     dkMemBlockDestroy(codeMem.block);
     dkQueueDestroy(queue);
-    dkDeviceDestroy(device);
 }
 
 int main(int argc, char* argv[])
@@ -855,19 +845,18 @@ int main(int argc, char* argv[])
     (void)argc; (void)argv;
 
     g_tStart = armGetSystemTick();
+    DkDeviceMaker devMaker;
+    dkDeviceMakerDefaults(&devMaker);
+    devMaker.cbDebug = debugCallback;
+    DkDevice device = dkDeviceCreate(&devMaker);
 
+    consoleGetDefault()->renderer = drakoConsoleRenderer(device);
     consoleInit(NULL);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
 
-    Result rc = romfsInit();
-    if (R_FAILED(rc)) {
-        printf("romfsInit failed: 0x%x\n", rc);
-    } else {
-        runDemo(&pad);
-        romfsExit();
-    }
+    runDemo(device, &pad);
 
     if (g_hud)
         drawAt(ROW_STATUS + 2, "Press + to exit.");
@@ -882,6 +871,7 @@ int main(int argc, char* argv[])
     }
 
     consoleExit(NULL);
+    dkDeviceDestroy(device);
     return 0;
 }
 

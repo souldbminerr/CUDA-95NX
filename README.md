@@ -1,6 +1,6 @@
-# CUDA-95NX
-- A Stress Testing Utility for the Nintendo Switch.
-- This tool is designed to fully stress and stability test the GPU inside the Nintendo Switch.
+# CUDA-95OZ
+- A Stress Testing Utility for the Nintendo Switch 2.
+- This tool is designed to fully stress and stability test the GPU inside the Nintendo Switch 2.
 - This tool can and will cause extreme stress to the GPU and its power delivery components if sufficiently clocked. 
 - If using for GPU testing, Core is preferable, however L2 is more sensitive to errors. However, since L2 does not draw as much power, lower temperatures are expected, reducing accuracy.
 - This tool can also be used to test memory, however it is more of a side effect. If testing memory, use Balanced, as Mem is too slow.
@@ -9,8 +9,8 @@
 - 4 Profiles, Balanced, Core, Mem, and L2
 - Balanced tries to evenly stress memory and the gpu core, with 64ALU Iterations and 32 random memory gather iterations
 - Core has 512ALU iterations and 4 RMG iterations, useful for stability (GPU UV) and by far the most intensive mode.
-- Mem has 8ALU and 256 RMG Iterations, testing over 4MB
-- L2 is identical to mem, however only tests over L2's 256KB
+- Mem has 8ALU and 256 RMG Iterations, testing over 16MB
+- L2 is identical to mem, however only tests over 512KB
 
 # Display
 - The main console displays stats of the current profile, with the numeber of batches and memory rates below
